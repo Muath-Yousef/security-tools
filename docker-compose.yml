@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: id-exposure-scanner
+    env_file:
+      - .env
+    volumes:
+      # Mount output directory so reports persist after container exits
+      - ./output:/app/output
+    # Override entrypoint args via: docker compose run scanner "IDENTIFIER"
+    # Example:
+    #   docker compose run scanner "1234567890"
+    #   docker compose run scanner "1234567890" --skip-platforms
+    network_mode: bridge
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
