@@ -43,6 +43,7 @@ def normalize(raw_identifier: str) -> dict:
             "original": str,
             "canonical": str,           # stripped & collapsed
             "variants": list[str],       # all unique search-ready forms
+            "id_type": str,              # detected type hint
         }
     """
     original = raw_identifier.strip()
@@ -59,11 +60,22 @@ def normalize(raw_identifier: str) -> dict:
     # 2. Extract pure digits
     digits_only = re.sub(r"\D", "", canonical)
 
+    id_type = "generic"
+
     if digits_only and len(digits_only) >= 4:
         _add(variants, digits_only)
 
         # ── Phone-number intelligence ──
-        _generate_phone_variants(digits_only, variants)
+        phone_detected = _generate_phone_variants(digits_only, variants)
+        if phone_detected:
+            id_type = "phone"
+
+        # ── National ID heuristic (10-digit all-numeric, no phone match) ──
+        elif len(digits_only) == 10 and not phone_detected:
+            id_type = "national_id"
+            # Common national-ID groupings: XXXX-XXXXXX  /  XXXXXX-XXXX
+            _add(variants, f"{digits_only[:4]}-{digits_only[4:]}")
+            _add(variants, f"{digits_only[:6]}-{digits_only[6:]}")
 
         # ── Generic groupings ──
         if len(digits_only) >= 7:
@@ -78,6 +90,7 @@ def normalize(raw_identifier: str) -> dict:
     _add(variants, original)
 
     # 4. Quoted exact-match for each non-quoted variant
+    #    (most impactful for precise search-engine matching)
     for v in list(variants):
         if not v.startswith('"'):
             _add(variants, f'"{v}"')
@@ -86,28 +99,31 @@ def normalize(raw_identifier: str) -> dict:
         "original": original,
         "canonical": canonical,
         "variants": variants,
+        "id_type": id_type,
     }
     logger.debug("Normalization result: {}", result)
     return result
 
 
-def _generate_phone_variants(digits: str, variants: list[str]) -> None:
+def _generate_phone_variants(digits: str, variants: list[str]) -> bool:
     """
     Generate locale-specific phone variants.
+    Returns True if a country code was successfully matched.
 
     Example for input "00962795714560":
         digits = "00962795714560"
         → detect country code 962 (Jordan)
         → local = 0795714560
         → international = +962795714560
-        → variants: 0795714560, 795714560, +962795714560, +962-79-571-4560, etc.
+        → variants: 0795714560, 795714560, +962795714560, +962-79-571-4560,
+                    (079) 571-4560, wa.me/962795714560 …
     """
     # Strip leading 00 (international dialing prefix)
     clean = digits
     if clean.startswith("00"):
         clean = clean[2:]
 
-    # Try to match a country code
+    # Try to match a country code (longest match first)
     matched_cc = None
     remainder = None
     for cc in sorted(_COUNTRY_CODES.keys(), key=len, reverse=True):
@@ -116,52 +132,70 @@ def _generate_phone_variants(digits: str, variants: list[str]) -> None:
             remainder = clean[len(cc):]
             break
 
-    if matched_cc and remainder and len(remainder) >= 6:
-        trunk = _COUNTRY_CODES[matched_cc]
-        local_number = trunk + remainder        # e.g. "0795714560"
-        intl_no_plus = matched_cc + remainder   # e.g. "962795714560"
-
-        logger.debug("Phone detected: CC={}, local={}, intl={}", matched_cc, local_number, intl_no_plus)
-
-        # Core forms
-        _add(variants, local_number)                         # 0795714560
-        _add(variants, remainder)                            # 795714560
-        _add(variants, f"+{intl_no_plus}")                   # +962795714560
-        _add(variants, f"00{intl_no_plus}")                  # 00962795714560
-
-        # Grouped: +962-79-571-4560  /  079-571-4560
-        if len(remainder) >= 7:
-            # Split local number into operator + subscriber
-            op_len = 2 if len(remainder) >= 9 else 1
-            operator = remainder[:op_len]
-            subscriber = remainder[op_len:]
-            sub_grouped = _group_subscriber(subscriber, "-")
-
-            _add(variants, f"+{matched_cc}-{operator}-{sub_grouped}")
-            _add(variants, f"+{matched_cc} {operator} {_group_subscriber(subscriber, ' ')}")
-            if trunk:
-                _add(variants, f"{trunk}{operator}-{sub_grouped}")
-                _add(variants, f"{trunk}{operator} {_group_subscriber(subscriber, ' ')}")
-
-        # WhatsApp-style: 962795714560 (no +, no 00)
-        _add(variants, intl_no_plus)
-    else:
-        # Not a recognized phone — still try +/00 forms
+    if not (matched_cc and remainder and len(remainder) >= 6):
+        # Not a recognised phone — still try +/00 prefix forms
         if len(digits) >= 10:
             _add(variants, f"+{digits}")
             _add(variants, f"00{digits}")
+        return False
+
+    trunk = _COUNTRY_CODES[matched_cc]
+    local_number = trunk + remainder        # e.g. "0795714560"
+    intl_no_plus = matched_cc + remainder  # e.g. "962795714560"
+
+    logger.debug("Phone detected: CC={}, local={}, intl={}", matched_cc, local_number, intl_no_plus)
+
+    # ── Core forms ──
+    _add(variants, local_number)               # 0795714560
+    _add(variants, remainder)                  # 795714560 (subscriber only)
+    _add(variants, f"+{intl_no_plus}")         # +962795714560
+    _add(variants, f"00{intl_no_plus}")        # 00962795714560
+    _add(variants, intl_no_plus)               # 962795714560  (WhatsApp-style)
+
+    # ── Grouped / formatted forms ──
+    if len(remainder) >= 7:
+        # Split local number into operator prefix + subscriber digits
+        op_len = 2 if len(remainder) >= 9 else 1
+        operator = remainder[:op_len]
+        subscriber = remainder[op_len:]
+        sub_dash  = _group_subscriber(subscriber, "-")
+        sub_space = _group_subscriber(subscriber, " ")
+
+        # International dashed/spaced
+        _add(variants, f"+{matched_cc}-{operator}-{sub_dash}")
+        _add(variants, f"+{matched_cc} {operator} {sub_space}")
+
+        if trunk:
+            # Local dashed/spaced
+            _add(variants, f"{trunk}{operator}-{sub_dash}")
+            _add(variants, f"{trunk}{operator} {sub_space}")
+            # Parenthesized: (079) 571-4560  — very common in classifieds
+            _add(variants, f"({trunk}{operator}) {sub_dash}")
+            _add(variants, f"({trunk}{operator}) {sub_space}")
+
+    # ── WhatsApp API URL forms ──
+    # These appear in shared chat links and social posts
+    _add(variants, f"wa.me/{intl_no_plus}")
+    _add(variants, f"wa.me/+{intl_no_plus}")
+    _add(variants, f"api.whatsapp.com/send?phone={intl_no_plus}")
+
+    return True
 
 
 def _group_subscriber(sub: str, sep: str) -> str:
-    """Group subscriber digits into 3-4 chunks."""
+    """Group subscriber digits into readable chunks."""
     n = len(sub)
-    if n <= 3:
-        return sub
     if n <= 4:
         return sub
-    if n <= 7:
+    if n <= 6:
         return f"{sub[:3]}{sep}{sub[3:]}"
-    return f"{sub[:3]}{sep}{sub[3:7]}{sep}{sub[7:]}" if n > 7 else f"{sub[:3]}{sep}{sub[3:]}"
+    if n == 7:
+        return f"{sub[:3]}{sep}{sub[3:]}"
+    if n == 8:
+        # e.g. 57144560 → 5714-4560 or 571-4560
+        return f"{sub[:4]}{sep}{sub[4:]}"
+    # 9+ digits: 3-3-rest
+    return f"{sub[:3]}{sep}{sub[3:6]}{sep}{sub[6:]}"
 
 
 # ── helpers ──
@@ -174,7 +208,7 @@ def _add(lst: list[str], value: str) -> None:
 
 
 def _group(digits: str, sep: str) -> str:
-    """Naively group a digit string into 3-4-4 / 3-3-4 chunks."""
+    """Group a digit string into 3-3-4 / 3-4-4 chunks."""
     n = len(digits)
     if n <= 4:
         return digits

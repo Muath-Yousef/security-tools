@@ -1,20 +1,34 @@
 """
 ID Exposure Scanner - Public Platforms Module
 Queries public platforms for identifier exposure via legal HTTP/API methods.
-Includes social media Google dorking, Truecaller API, and improved Reddit.
+
+Improvements over v1:
+  - Paste sites updated (Ghostbin removed, active alternatives added)
+  - Wayback Machine CDX URL search added
+  - GitLab snippets endpoint added
+  - DuckDuckGo HTML search (proper results, not just Instant Answer)
+  - More regional Arabic/MENA platforms added
+  - CAPTCHA detection imported from search_engines
 """
 
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs, urlencode, unquote
 
 import requests
 from bs4 import BeautifulSoup
 from loguru import logger
 
 from config import Config
-from modules.search_engines import SearchResult, _request_with_retry, VERBOSE
+from modules.search_engines import (
+    SearchResult,
+    _request_with_retry,
+    _is_captcha_response,
+    search_duckduckgo_html,
+    VERBOSE,
+)
 
 
 def _ts() -> str:
@@ -103,11 +117,9 @@ def _search_reddit_html(identifier: str, *, max_results: int | None = None) -> l
     max_results = max_results or Config.MAX_RESULTS_PER_SOURCE
     results: list[SearchResult] = []
 
-    # old.reddit.com is less aggressive with blocking
     url = "https://old.reddit.com/search"
     headers = Config.headers()
-    # Reddit specifically checks for a descriptive UA
-    headers["User-Agent"] = "IDExposureScanner/1.0 (Security Assessment Tool)"
+    headers["User-Agent"] = "IDExposureScanner/2.0 (Security Assessment Tool)"
 
     logger.info("[Reddit] Searching: {!r}", identifier)
     ts = _ts()
@@ -156,7 +168,7 @@ def _search_reddit_oauth(identifier: str, *, max_results: int | None = None) -> 
             "https://www.reddit.com/api/v1/access_token",
             auth=(Config.REDDIT_CLIENT_ID, Config.REDDIT_CLIENT_SECRET),
             data={"grant_type": "client_credentials"},
-            headers={"User-Agent": "IDExposureScanner/1.0"},
+            headers={"User-Agent": "IDExposureScanner/2.0"},
             timeout=Config.REQUEST_TIMEOUT,
         )
         auth_resp.raise_for_status()
@@ -171,7 +183,7 @@ def _search_reddit_oauth(identifier: str, *, max_results: int | None = None) -> 
         "GET", "https://oauth.reddit.com/search",
         headers={
             "Authorization": f"Bearer {token}",
-            "User-Agent": "IDExposureScanner/1.0",
+            "User-Agent": "IDExposureScanner/2.0",
         },
         params={"q": identifier, "limit": str(min(max_results, 25)), "sort": "relevance"},
     )
@@ -192,14 +204,15 @@ def _search_reddit_oauth(identifier: str, *, max_results: int | None = None) -> 
 
 
 # ═══════════════════════════════════════════════════════════════
-#  GitLab  (Public API)
+#  GitLab  (Public API — code + snippets)
 # ═══════════════════════════════════════════════════════════════
 
 def search_gitlab(identifier: str, *, max_results: int | None = None) -> list[SearchResult]:
-    """Search GitLab public projects."""
+    """Search GitLab public projects and snippets."""
     max_results = max_results or Config.MAX_RESULTS_PER_SOURCE
     results: list[SearchResult] = []
 
+    # ── Project search ──
     logger.info("[GitLab] Searching projects: {!r}", identifier)
     ts = _ts()
 
@@ -210,76 +223,134 @@ def search_gitlab(identifier: str, *, max_results: int | None = None) -> list[Se
     if resp and resp.ok:
         for project in resp.json()[:max_results]:
             results.append(SearchResult(
-                source="gitlab", query=identifier,
+                source="gitlab_project", query=identifier,
                 title=project.get("name_with_namespace", ""),
                 link=project.get("web_url", ""),
                 snippet=project.get("description", "") or "",
                 timestamp=ts,
             ))
 
-    logger.info("[GitLab] Found {} results", len(results))
+    Config.random_delay()
+
+    # ── Snippet search (often overlooked, can contain leaked data) ──
+    logger.info("[GitLab] Searching snippets: {!r}", identifier)
+    ts = _ts()
+
+    resp = _request_with_retry(
+        "GET", "https://gitlab.com/api/v4/snippets",
+        params={"search": identifier, "per_page": min(max_results, 20)},
+    )
+    if resp and resp.ok:
+        for snippet in resp.json()[:max_results]:
+            results.append(SearchResult(
+                source="gitlab_snippet", query=identifier,
+                title=snippet.get("title", ""),
+                link=snippet.get("web_url", ""),
+                snippet=snippet.get("description", "") or "",
+                timestamp=ts,
+            ))
+    elif resp:
+        logger.debug("[GitLab] Snippets search returned HTTP {}", resp.status_code)
+
+    logger.info("[GitLab] Total results: {}", len(results))
     Config.random_delay()
     return results
 
 
 # ═══════════════════════════════════════════════════════════════
-#  DuckDuckGo  (Instant Answer API)
+#  DuckDuckGo  (HTML search — far richer than Instant Answer API)
 # ═══════════════════════════════════════════════════════════════
 
 def search_duckduckgo(identifier: str, *, max_results: int | None = None) -> list[SearchResult]:
-    """Query DuckDuckGo Instant Answer API."""
+    """
+    DuckDuckGo HTML search (replaces the old Instant Answer API call).
+    The IA API returned at most 1 result; HTML gives real SERP results.
+    """
+    return search_duckduckgo_html(identifier, max_results=max_results)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Wayback Machine CDX API
+# ═══════════════════════════════════════════════════════════════
+
+def search_wayback_machine(identifier: str, *, max_results: int | None = None) -> list[SearchResult]:
+    """
+    Search the Internet Archive CDX index for URLs containing the identifier.
+    This finds pages that were indexed (and possibly later deleted) — very
+    useful for catching leaked data that has since been taken down.
+    """
     max_results = max_results or Config.MAX_RESULTS_PER_SOURCE
     results: list[SearchResult] = []
 
-    logger.info("[DuckDuckGo] Searching: {!r}", identifier)
+    logger.info("[Wayback] CDX URL search for: {!r}", identifier)
     ts = _ts()
 
+    # The CDX API searches URLs (not full text) — still catches IDs that
+    # appeared as URL path/query parameters (common in classifieds, forms).
     resp = _request_with_retry(
-        "GET", "https://api.duckduckgo.com/",
-        params={"q": identifier, "format": "json", "no_html": "1", "skip_disambig": "1"},
+        "GET", "https://web.archive.org/cdx/search/cdx",
+        params={
+            "url": f"*{identifier}*",
+            "output": "json",
+            "limit": str(min(max_results, 30)),
+            "fl": "original,timestamp,statuscode,mimetype",
+            "filter": ["statuscode:200", "mimetype:text/html"],
+            "collapse": "urlkey",
+        },
     )
     if resp is None or not resp.ok:
+        logger.warning("[Wayback] CDX search failed ({})",
+                       resp.status_code if resp else "no response")
         Config.random_delay()
         return results
 
     try:
-        data = resp.json()
+        rows = resp.json()
     except ValueError:
         Config.random_delay()
         return results
 
-    if data.get("AbstractText"):
+    if not rows or len(rows) < 2:
+        Config.random_delay()
+        return results
+
+    # Row 0 is the column-header row
+    col_names = rows[0]
+    col = {name: idx for idx, name in enumerate(col_names)}
+
+    for row in rows[1 : max_results + 1]:
+        try:
+            original_url = row[col["original"]]
+            timestamp    = row[col["timestamp"]]
+        except (KeyError, IndexError):
+            continue
+
+        archive_url = f"https://web.archive.org/web/{timestamp}/{original_url}"
+        year = timestamp[:4] if len(timestamp) >= 4 else "?"
+
         results.append(SearchResult(
-            source="duckduckgo", query=identifier,
-            title=data.get("Heading", ""),
-            link=data.get("AbstractURL", ""),
-            snippet=data["AbstractText"][:500],
+            source="wayback_machine",
+            query=identifier,
+            title=f"Archived: {original_url}",
+            link=archive_url,
+            snippet=f"URL contained identifier. Archived {year}. Original: {original_url}",
             timestamp=ts,
         ))
 
-    for topic in data.get("RelatedTopics", [])[:max_results]:
-        if isinstance(topic, dict) and topic.get("FirstURL"):
-            results.append(SearchResult(
-                source="duckduckgo", query=identifier,
-                title=topic.get("Text", "")[:120],
-                link=topic["FirstURL"],
-                snippet=topic.get("Text", "")[:300],
-                timestamp=ts,
-            ))
-
-    logger.info("[DuckDuckGo] Found {} results", len(results))
+    logger.info("[Wayback] Found {} archived URLs containing identifier", len(results))
     Config.random_delay()
     return results
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Social Media Google Dorking (Facebook, Twitter, Instagram, etc.)
+#  Social Media Google Dorking
 # ═══════════════════════════════════════════════════════════════
 
 def search_social_media(identifier: str, *, max_results: int | None = None) -> list[SearchResult]:
     """
     Use Google dorking to find the identifier on social media platforms.
-    Targets: Facebook, Twitter/X, Instagram, LinkedIn, TikTok, Telegram.
+    Targets: Facebook, Twitter/X, Instagram, LinkedIn, TikTok, Telegram,
+             Snapchat, WhatsApp-link sites.
     """
     max_results = max_results or Config.MAX_RESULTS_PER_SOURCE
     results: list[SearchResult] = []
@@ -291,6 +362,8 @@ def search_social_media(identifier: str, *, max_results: int | None = None) -> l
         ("linkedin",  "site:linkedin.com"),
         ("tiktok",    "site:tiktok.com"),
         ("telegram",  "site:t.me OR site:telegram.me"),
+        ("snapchat",  "site:snapchat.com"),
+        ("whatsapp",  "site:wa.me OR site:api.whatsapp.com"),
     ]
 
     for platform_name, site_filter in platforms:
@@ -300,15 +373,23 @@ def search_social_media(identifier: str, *, max_results: int | None = None) -> l
 
         resp = _request_with_retry(
             "GET", "https://www.google.com/search",
-            params={"q": dork, "num": min(max_results, 10), "hl": "en"},
+            params={"q": dork, "num": min(max_results, 10), "hl": "en", "gl": "us"},
         )
         if resp is None or not resp.ok:
             logger.warning("[Social/{}] Google dork failed", platform_name)
             Config.random_delay()
             continue
 
+        if _is_captcha_response(resp.text):
+            logger.warning("[Social/{}] CAPTCHA detected — skipping", platform_name)
+            Config.random_delay()
+            continue
+
         soup = BeautifulSoup(resp.text, "lxml")
-        for div in soup.select("div.g")[:max_results]:
+        # Flexible container selector
+        result_items = soup.select("div.g") or soup.select("div.tF2Cxc")
+
+        for div in result_items[:max_results]:
             a_tag = div.select_one("a[href]")
             if not a_tag:
                 continue
@@ -317,7 +398,11 @@ def search_social_media(identifier: str, *, max_results: int | None = None) -> l
                 continue
             title_el = div.select_one("h3")
             title = title_el.get_text(strip=True) if title_el else ""
-            snippet_el = div.select_one("div.VwiC3b, span.st, div[data-sncf]")
+            snippet_el = (
+                div.select_one("div.VwiC3b")
+                or div.select_one("span.st")
+                or div.select_one("div[data-sncf]")
+            )
             snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
 
             results.append(SearchResult(
@@ -332,11 +417,11 @@ def search_social_media(identifier: str, *, max_results: int | None = None) -> l
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Local Platforms (OpenSooq, etc.)
+#  Local / Regional Platforms (MENA classifieds, forums)
 # ═══════════════════════════════════════════════════════════════
 
 def search_local_platforms(identifier: str, *, max_results: int | None = None) -> list[SearchResult]:
-    """Google dorking for local/regional platforms (classifieds, forums)."""
+    """Google dorking for local/regional platforms (classifieds, forums, real-estate)."""
     max_results = max_results or Config.MAX_RESULTS_PER_SOURCE
     results: list[SearchResult] = []
 
@@ -344,9 +429,10 @@ def search_local_platforms(identifier: str, *, max_results: int | None = None) -
         ("opensooq",    "site:opensooq.com"),
         ("haraj",       "site:haraj.com.sa"),
         ("dubizzle",    "site:dubizzle.com OR site:bayut.com"),
-        ("olx",         "site:olx.com"),
-        ("yellowpages", "site:yellowpages.com OR site:yellowpages.ae"),
-        ("forums",      "site:forum.* OR site:montada.*"),
+        ("olx_mena",    "site:olx.com.eg OR site:olx.jo OR site:olx.sa"),
+        ("waseet",      "site:waseet.net OR site:q8waseet.net"),
+        ("yellowpages", "site:yellowpages.ae OR site:yellowpages.com.jo"),
+        ("forums",      "site:arabteam2000.com OR site:vb.arabsgate.com"),
     ]
 
     for name, site_filter in sites:
@@ -362,8 +448,15 @@ def search_local_platforms(identifier: str, *, max_results: int | None = None) -
             Config.random_delay()
             continue
 
+        if _is_captcha_response(resp.text):
+            logger.warning("[Local/{}] CAPTCHA detected — skipping", name)
+            Config.random_delay()
+            continue
+
         soup = BeautifulSoup(resp.text, "lxml")
-        for div in soup.select("div.g")[:max_results]:
+        result_items = soup.select("div.g") or soup.select("div.tF2Cxc")
+
+        for div in result_items[:max_results]:
             a_tag = div.select_one("a[href]")
             if not a_tag:
                 continue
@@ -387,15 +480,29 @@ def search_local_platforms(identifier: str, *, max_results: int | None = None) -
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Paste Sites (pastebin, dpaste, etc.)
+#  Paste Sites
 # ═══════════════════════════════════════════════════════════════
 
 def search_pastebin_like(identifier: str, *, max_results: int | None = None) -> list[SearchResult]:
-    """Search for pastes containing the identifier via Google dorking."""
+    """
+    Search for pastes containing the identifier via Google dorking.
+
+    Sites list updated v2:
+      - Removed: Ghostbin (defunct since 2021)
+      - Added: paste.fo, justpaste.it, rentry.co, privatebin.net,
+               controlc.com, paste.gg
+    """
     max_results = max_results or Config.MAX_RESULTS_PER_SOURCE
     results: list[SearchResult] = []
 
-    dork = f'"{identifier}" (site:pastebin.com OR site:dpaste.org OR site:ghostbin.co OR site:paste.org)'
+    dork = (
+        f'"{identifier}" ('
+        f'site:pastebin.com OR site:dpaste.org OR '
+        f'site:paste.fo OR site:justpaste.it OR '
+        f'site:rentry.co OR site:controlc.com OR '
+        f'site:paste.gg OR site:hastebin.com'
+        f')'
+    )
     logger.info("[Paste] Dorking: {}", dork)
     ts = _ts()
 
@@ -407,8 +514,15 @@ def search_pastebin_like(identifier: str, *, max_results: int | None = None) -> 
         Config.random_delay()
         return results
 
+    if _is_captcha_response(resp.text):
+        logger.warning("[Paste] CAPTCHA detected")
+        Config.random_delay()
+        return results
+
     soup = BeautifulSoup(resp.text, "lxml")
-    for div in soup.select("div.g")[:max_results]:
+    result_items = soup.select("div.g") or soup.select("div.tF2Cxc")
+
+    for div in result_items[:max_results]:
         a_tag = div.select_one("a[href]")
         if not a_tag:
             continue
@@ -447,7 +561,6 @@ def search_truecaller(identifier: str, *, max_results: int | None = None) -> lis
     logger.info("[Truecaller] Looking up: {!r}", identifier)
     ts = _ts()
 
-    # Truecaller API v2 (requires enterprise/authorized access)
     resp = _request_with_retry(
         "GET", "https://api4.truecaller.com/v1/search",
         headers={
@@ -488,7 +601,8 @@ ALL_PLATFORM_SCANNERS = [
     search_github,
     search_reddit,
     search_gitlab,
-    search_duckduckgo,
+    search_duckduckgo,       # now uses HTML search (richer results)
+    search_wayback_machine,  # NEW: archived pages with ID in URL
     search_social_media,
     search_local_platforms,
     search_pastebin_like,
